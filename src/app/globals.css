@@ -1,0 +1,204 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * SubTrack VIP — global surface treatment.
+ *
+ * The look is built from four layers stacked in this order, and the order is
+ * what sells it:
+ *   1. obsidian ground        near-black, never pure #000 (pure black kills depth)
+ *   2. gold veil              a single radial wash from the top edge
+ *   3. film grain             ~2% monochrome noise, defeats gradient banding
+ *   4. frosted glass panels   backdrop-blur over the whole stack
+ *
+ * Remove the grain and the large dark gradients band visibly on OLED laptops;
+ * it is the cheapest thing in the file and the most load-bearing.
+ */
+
+@layer base {
+  :root {
+    --font-sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI',
+      'Inter', system-ui, sans-serif;
+    --font-numeric: 'SF Mono', ui-monospace, 'JetBrains Mono', 'Menlo', monospace;
+
+    --obsidian: #070709;
+    --charcoal: #111116;
+    --champagne: #e6b04c;
+    --amber: #f59e0b;
+    --emerald: #10b981;
+    --indigo: #6366f1;
+    --rose: #f43f5e;
+
+    --hairline: rgba(255, 255, 255, 0.08);
+    --hairline-gold: rgba(230, 176, 76, 0.2);
+  }
+
+  * {
+    border-color: var(--hairline);
+  }
+
+  html {
+    /* Financial figures must never reflow between renders. */
+    font-variant-numeric: tabular-nums;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    background-color: var(--obsidian);
+    color: rgb(244 244 245);
+    font-family: var(--font-sans);
+    min-height: 100vh;
+    position: relative;
+    overflow-x: hidden;
+  }
+
+  /* Layer 2 — the gold veil. Fixed, so it never scrolls away from the header. */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 0;
+    background:
+      radial-gradient(110% 70% at 50% -10%, rgba(230, 176, 76, 0.11) 0%, rgba(7, 7, 9, 0) 58%),
+      radial-gradient(80% 50% at 100% 0%, rgba(99, 102, 241, 0.07) 0%, rgba(7, 7, 9, 0) 50%);
+  }
+
+  /* Layer 3 — film grain. */
+  body::after {
+    content: '';
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 0;
+    opacity: 0.022;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 220 220' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  }
+
+  ::selection {
+    background: rgba(230, 176, 76, 0.28);
+    color: #fff;
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 999px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(230, 176, 76, 0.35);
+    background-clip: content-box;
+  }
+}
+
+@layer components {
+  /* Layer 4 — the frosted panel. */
+  .vip-panel {
+    @apply relative rounded-2xl border border-white/[0.07] bg-white/[0.02] backdrop-blur-xl;
+    box-shadow:
+      0 24px 60px -24px rgba(0, 0, 0, 0.9),
+      inset 0 1px 0 0 rgba(255, 255, 255, 0.045);
+  }
+
+  /*
+   * A one-pixel champagne highlight along the top edge, fading out at both
+   * ends. This is the single detail that reads as "expensive" — it mimics the
+   * bevel on a metal card catching light.
+   */
+  .vip-panel::before {
+    content: '';
+    position: absolute;
+    inset-inline: 1.25rem;
+    top: 0;
+    height: 1px;
+    background: linear-gradient(
+      90deg,
+      transparent,
+      rgba(230, 176, 76, 0.45) 22%,
+      rgba(255, 255, 255, 0.5) 50%,
+      rgba(230, 176, 76, 0.45) 78%,
+      transparent
+    );
+    opacity: 0.55;
+    pointer-events: none;
+  }
+
+  .vip-panel-flat::before {
+    display: none;
+  }
+
+  .gold-text {
+    background: linear-gradient(135deg, #f8ecd0 0%, #e6b04c 42%, #d18a1f 68%, #f1d9a3 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  .hairline-gold {
+    border-color: var(--hairline-gold);
+  }
+
+  /* Shimmer skeleton — a moving specular band, not a pulsing grey box. */
+  .shimmer {
+    @apply relative overflow-hidden bg-white/[0.035];
+  }
+  .shimmer::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    transform: translateX(-100%);
+    background: linear-gradient(
+      90deg,
+      transparent,
+      rgba(230, 176, 76, 0.09) 45%,
+      rgba(255, 255, 255, 0.06) 55%,
+      transparent
+    );
+    animation: shimmer 1.8s infinite;
+  }
+
+  @keyframes shimmer {
+    100% {
+      transform: translateX(100%);
+    }
+  }
+
+  .numeric {
+    font-family: var(--font-numeric);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.01em;
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+
+  /* Fades the bottom of a scroll area instead of cutting content off hard. */
+  .mask-fade-b {
+    -webkit-mask-image: linear-gradient(to bottom, black 82%, transparent 100%);
+    mask-image: linear-gradient(to bottom, black 82%, transparent 100%);
+  }
+}
+
+/* Users who ask for less motion get none of the decorative kind. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

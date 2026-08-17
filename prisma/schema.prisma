@@ -1,0 +1,578 @@
+// =============================================================================
+//  SubTrack VIP — Data model
+// =============================================================================
+//  Design notes
+//  ------------
+//  * Money is stored as Decimal(14,2), never Float. Turkish Lira amounts on
+//    consumer statements comfortably fit, and Decimal keeps arithmetic exact.
+//  * Every tenant-scoped table carries a denormalised `userId` even when it is
+//    reachable through a parent relation. This is a deliberate concession to
+//    PostgreSQL Row-Level Security: an RLS policy must be evaluable from the
+//    row itself without a join. See `prisma/rls.sql`.
+//  * Provider credentials are never stored. We persist only an opaque
+//    `providerAccountRef` handed back by the aggregator (AÖH / Paycell /
+//    Finrota) plus an encrypted refresh token envelope.
+//  * Detection output is materialised into `Subscription` rather than computed
+//    on every request: the heuristics are deterministic, so a materialised
+//    stream is both cheaper and auditable (`detectionSnapshot`).
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// -----------------------------------------------------------------------------
+//  Enums
+// -----------------------------------------------------------------------------
+
+enum BankProviderKind {
+  MOCK //     Deterministic simulator used for demos and tests
+  AOH //      Açık Bankacılık Hizmetleri (Turkish open-banking gateway)
+  PAYCELL //  Turkcell Paycell aggregation
+  FINROTA //  Finrota corporate aggregation
+}
+
+enum AccountType {
+  CHECKING //     Vadesiz mevduat
+  CREDIT_CARD //  Kredi kartı
+  PREPAID //      Ön ödemeli (Papara, Enpara kart)
+  SAVINGS //      Vadeli mevduat
+}
+
+enum AccountSyncStatus {
+  PENDING
+  ACTIVE
+  REAUTH_REQUIRED //  Consent expired — Turkish open banking mandates 90-day re-consent
+  DISCONNECTED
+  ERROR
+}
+
+enum TransactionDirection {
+  DEBIT
+  CREDIT
+}
+
+/// How the merchant actually pulls the money. This is the single most important
+/// field for cancellation UX: the user's cancel path is entirely determined by
+/// the billing rail, not by the merchant.
+enum BillingChannel {
+  APPLE_IAP //            Apple In-App Purchase (APPLE.COM/BILL)
+  GOOGLE_PLAY //          Google Play Billing (GOOGLE *)
+  DIRECT_CARD //          Merchant charges the card directly
+  BANK_STANDING_ORDER //  Otomatik ödeme talimatı / düzenli ödeme talimatı
+  CARRIER_BILLING //      Mobil ödeme (Turkcell / Vodafone / Türk Telekom faturasına yansıtma)
+  WALLET //               Papara / Paycell wallet pull
+  UNKNOWN
+}
+
+enum SubscriptionCategory {
+  ENTERTAINMENT //  Eğlence & video
+  MUSIC //          Müzik
+  AI_CLOUD //       Yapay zekâ & bulut
+  SAAS //           Yazılım & üretkenlik
+  FITNESS //        Spor & sağlık
+  UTILITIES //      Faturalar
+  TELECOM //        Telekomünikasyon
+  NEWS_MEDIA //     Haber & yayın
+  GAMING //         Oyun
+  EDUCATION //      Eğitim
+  FOOD_DELIVERY //  Yemek & market aboneliği
+  TRANSPORT //      Ulaşım
+  INSURANCE //      Sigorta
+  OTHER
+}
+
+enum BillingCycle {
+  WEEKLY
+  MONTHLY
+  QUARTERLY
+  SEMIANNUAL
+  YEARLY
+  IRREGULAR
+}
+
+enum SubscriptionState {
+  ACTIVE //             Detected, recurring, still charging
+  VARIABLE_BILL //      Recurring but amount fluctuates (utility / telecom)
+  PAUSED //             User-declared pause, no charge in the current window
+  CANCELLATION_STARTED
+  CANCELLED //          Confirmed cancelled by the user
+  LAPSED //             Stopped charging on its own (trial ended, card expired)
+  CANDIDATE //          Below the confidence threshold — needs user confirmation
+}
+
+enum RiskBand {
+  LOW //       Düşük
+  MODERATE //  Orta
+  HIGH //      Yüksek
+  CRITICAL //  Kritik
+}
+
+enum CancellationStatus {
+  DRAFT
+  GUIDE_ISSUED
+  USER_SUBMITTED //     User confirmed they followed the steps
+  AWAITING_CONFIRMATION // Waiting for the billing window to prove it stopped
+  CONFIRMED
+  FAILED
+  ROGUE_CHARGE_DETECTED // Post-cancellation guard tripped
+}
+
+enum AlertKind {
+  RENEWAL_UPCOMING
+  PRICE_HIKE
+  ZOMBIE_SUBSCRIPTION
+  ROGUE_CHARGE
+  DUPLICATE_SERVICE
+  TRIAL_ENDING
+}
+
+enum AlertSeverity {
+  INFO
+  WARNING
+  CRITICAL
+}
+
+// -----------------------------------------------------------------------------
+//  Identity
+// -----------------------------------------------------------------------------
+
+model User {
+  id        String  @id @default(uuid()) @db.Uuid
+  email     String  @unique
+  fullName  String
+  /// Argon2id hash. Null for SSO-only accounts.
+  passwordHash String?
+  /// IANA zone — renewal predictions are rendered in the user's local time.
+  timezone  String  @default("Europe/Istanbul")
+  locale    String  @default("tr-TR")
+  currency  String  @default("TRY")
+
+  /// Notify N days before a predicted renewal. Drives `Alert` generation.
+  renewalLeadDays Int @default(3)
+  /// Zombie-risk score above which we escalate to a CRITICAL alert.
+  zombieAlertThreshold Int @default(70)
+
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  bankAccounts       BankAccount[]
+  transactions       Transaction[]
+  subscriptions      Subscription[]
+  cancellationCases  CancellationCase[]
+  alerts             Alert[]
+  engagementSignals  EngagementSignal[]
+  merchantOverrides  MerchantOverride[]
+  detectionRuns      DetectionRun[]
+
+  @@map("users")
+}
+
+// -----------------------------------------------------------------------------
+//  Institutions & accounts
+// -----------------------------------------------------------------------------
+
+/// Catalogue of connectable institutions. Global (not tenant-scoped) so the
+/// connect screen can be rendered before the user authenticates anything.
+model Institution {
+  id            String           @id
+  provider      BankProviderKind
+  displayName   String
+  legalName     String
+  /// Hex brand colour, used for the account chip accent in the UI.
+  brandColor    String
+  logoSlug      String
+  bic           String?
+  /// Feature flags the aggregator advertises for this bank.
+  supportsStandingOrderCancellation Boolean @default(false)
+  supportsInstantBalance            Boolean @default(true)
+  /// Days of history the institution will hand back on first connect.
+  historyWindowDays Int @default(730)
+  isEnabled     Boolean  @default(true)
+  createdAt     DateTime @default(now())
+
+  accounts BankAccount[]
+
+  @@index([provider, isEnabled])
+  @@map("institutions")
+}
+
+model BankAccount {
+  id            String @id @default(uuid()) @db.Uuid
+  userId        String @db.Uuid
+  institutionId String
+
+  /// Opaque handle returned by the aggregator. Never a real account number.
+  providerAccountRef String
+  displayName        String
+  accountType        AccountType
+  /// Last four digits only — never persist a full PAN or IBAN.
+  maskedNumber       String
+  ibanSuffix         String?
+  currency           String            @default("TRY")
+  balance            Decimal?          @db.Decimal(14, 2)
+  availableBalance   Decimal?          @db.Decimal(14, 2)
+
+  syncStatus     AccountSyncStatus @default(PENDING)
+  /// Encrypted (AES-256-GCM) refresh-token envelope, base64. App-layer keys.
+  credentialsEnvelope String?
+  /// Turkish open banking requires re-consent every 90 days.
+  consentExpiresAt DateTime?
+  lastSyncedAt     DateTime?
+  lastSyncError    String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  institution  Institution   @relation(fields: [institutionId], references: [id])
+  transactions Transaction[]
+
+  @@unique([userId, providerAccountRef])
+  @@index([userId, syncStatus])
+  @@map("bank_accounts")
+}
+
+// -----------------------------------------------------------------------------
+//  Transactions
+// -----------------------------------------------------------------------------
+
+model Transaction {
+  id            String @id @default(uuid()) @db.Uuid
+  userId        String @db.Uuid
+  bankAccountId String @db.Uuid
+
+  /// Aggregator-side id. Together with the account it guarantees idempotent
+  /// re-sync: the same statement line can be fetched many times safely.
+  providerTxnRef String
+
+  bookedAt   DateTime
+  valueDate  DateTime?
+  /// Always positive. Sign lives in `direction` so aggregations never depend on
+  /// whichever convention a given bank happens to use.
+  amount     Decimal              @db.Decimal(14, 2)
+  currency   String               @default("TRY")
+  direction  TransactionDirection @default(DEBIT)
+
+  /// Raw statement descriptor, exactly as the bank returned it. Immutable —
+  /// the normalisation layer must always be re-runnable from the original.
+  rawDescriptor String
+  /// Output of MerchantNormalizer: "Netflix", "Spotify", ...
+  normalizedMerchant String?
+  /// Stable slug used to group a recurring stream: "netflix", "spotify".
+  merchantKey        String?
+  /// Bank's own MCC when provided.
+  mcc                String?
+  detectedChannel    BillingChannel @default(UNKNOWN)
+
+  /// Set once the detection engine attributes this line to a stream.
+  subscriptionId String? @db.Uuid
+
+  /// Free-form aggregator payload kept for forensics / re-processing.
+  providerMetadata Json?
+
+  createdAt DateTime @default(now())
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  bankAccount  BankAccount  @relation(fields: [bankAccountId], references: [id], onDelete: Cascade)
+  subscription Subscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+
+  @@unique([bankAccountId, providerTxnRef])
+  @@index([userId, bookedAt(sort: Desc)])
+  @@index([userId, merchantKey, bookedAt])
+  @@index([subscriptionId, bookedAt])
+  @@map("transactions")
+}
+
+// -----------------------------------------------------------------------------
+//  Subscriptions (materialised detection output)
+// -----------------------------------------------------------------------------
+
+model Subscription {
+  id     String @id @default(uuid()) @db.Uuid
+  userId String @db.Uuid
+
+  merchantKey     String
+  merchantName    String
+  category        SubscriptionCategory @default(OTHER)
+  billingChannel  BillingChannel       @default(UNKNOWN)
+  /// Account the most recent charge landed on. A stream can migrate between
+  /// cards, so this is "current", not "owning".
+  primaryAccountId String? @db.Uuid
+
+  state        SubscriptionState @default(CANDIDATE)
+  billingCycle BillingCycle      @default(MONTHLY)
+  /// Observed median interval in days. Kept alongside `billingCycle` because
+  /// "monthly" covers 28–32 days and the exact figure drives predictions.
+  cycleDays    Int
+
+  /// Latest charged amount, and the monthly-equivalent used for burn-rate math.
+  currentAmount     Decimal @db.Decimal(14, 2)
+  monthlyEquivalent Decimal @db.Decimal(14, 2)
+  currency          String  @default("TRY")
+
+  firstChargedAt DateTime
+  lastChargedAt  DateTime
+  occurrences    Int
+
+  /// Predicted next charge plus a tolerance window in days.
+  nextRenewalAt        DateTime?
+  renewalWindowDays    Int      @default(2)
+
+  /// 0..1 — how sure the heuristics are that this is a real subscription.
+  detectionConfidence Float
+  /// 0..100 — forgotten/zombie risk. See RiskEngine.
+  forgottenRiskScore  Int      @default(0)
+  riskBand            RiskBand @default(LOW)
+  /// Human-readable (Turkish) factor breakdown shown in the risk drawer.
+  riskFactors         Json?
+
+  /// Full audit trail of the run that produced this row: intervals, amount
+  /// clusters, scores. Makes every number on the dashboard explainable.
+  detectionSnapshot Json?
+
+  /// User overrides — these always win over the heuristics.
+  userConfirmed Boolean @default(false)
+  userIgnored   Boolean @default(false)
+  userLabel     String?
+  notes         String?
+
+  cancelledAt DateTime?
+  /// Post-cancellation guard watches for charges after this date.
+  guardActiveUntil DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user              User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions      Transaction[]
+  priceChanges      PriceChange[]
+  cancellationCases CancellationCase[]
+  alerts            Alert[]
+
+  @@unique([userId, merchantKey])
+  @@index([userId, state])
+  @@index([userId, nextRenewalAt])
+  @@index([userId, forgottenRiskScore(sort: Desc)])
+  @@map("subscriptions")
+}
+
+/// One row per detected price step. The historical timeline is never rewritten
+/// when a price changes — we append, so the Price Hike Radar can quantify the
+/// extra lira the hike has already cost.
+model PriceChange {
+  id             String @id @default(uuid()) @db.Uuid
+  subscriptionId String @db.Uuid
+
+  previousAmount Decimal  @db.Decimal(14, 2)
+  newAmount      Decimal  @db.Decimal(14, 2)
+  deltaAmount    Decimal  @db.Decimal(14, 2)
+  deltaPercent   Float
+  effectiveAt    DateTime
+  /// Cumulative extra spend caused by this step, recomputed on each run.
+  extraPaidToDate Decimal @db.Decimal(14, 2) @default(0)
+  /// True when the step is a decrease (campaign price, downgrade).
+  isDecrease     Boolean  @default(false)
+
+  createdAt DateTime @default(now())
+
+  subscription Subscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+
+  @@unique([subscriptionId, effectiveAt])
+  @@index([subscriptionId, effectiveAt(sort: Desc)])
+  @@map("price_changes")
+}
+
+// -----------------------------------------------------------------------------
+//  Cancellation
+// -----------------------------------------------------------------------------
+
+/// Editorial content, not user data. A guide is selected by
+/// (merchantKey | category) × billingChannel, so a merchant with no bespoke
+/// guide still resolves to a sane channel-level fallback.
+model CancellationGuide {
+  id          String @id @default(uuid()) @db.Uuid
+  merchantKey String?
+  category    SubscriptionCategory?
+  channel     BillingChannel
+
+  /// Turkish UI copy.
+  title       String
+  summary     String
+  /// Ordered steps: [{ order, title, detail, deepLink?, warning? }]
+  steps       Json
+  /// Where the cancel action actually lives.
+  deepLink    String?
+  webUrl      String?
+  phoneNumber String?
+  supportEmail String?
+
+  estimatedMinutes  Int     @default(3)
+  /// 1 = trivial, 5 = hostile retention flow.
+  difficulty        Int     @default(1)
+  /// Does the service keep running until period end after cancelling?
+  refundPolicyNote  String?
+  requiresIdentityProof Boolean @default(false)
+
+  /// Handlebars-style template for BANK_STANDING_ORDER cancellations.
+  mandateTemplate String?
+
+  locale    String   @default("tr-TR")
+  version   Int      @default(1)
+  isActive  Boolean  @default(true)
+  updatedAt DateTime @updatedAt
+
+  cases CancellationCase[]
+
+  @@unique([merchantKey, channel, locale, version])
+  @@index([category, channel])
+  @@map("cancellation_guides")
+}
+
+/// A user's actual attempt to cancel something.
+model CancellationCase {
+  id             String @id @default(uuid()) @db.Uuid
+  userId         String @db.Uuid
+  subscriptionId String @db.Uuid
+  guideId        String? @db.Uuid
+
+  status  CancellationStatus @default(DRAFT)
+  channel BillingChannel
+
+  /// Rendered mandate letter / directive the user copied or submitted.
+  renderedDirective String?
+  /// Steps the user has ticked off: [{ order, completedAt }]
+  completedSteps    Json?
+
+  /// Money we expect to stop bleeding, monthly.
+  expectedMonthlySaving Decimal @db.Decimal(14, 2) @default(0)
+  /// Realised saving, filled in once the guard window closes clean.
+  realizedMonthlySaving Decimal? @db.Decimal(14, 2)
+
+  startedAt   DateTime  @default(now())
+  submittedAt DateTime?
+  confirmedAt DateTime?
+  /// Guard watches this long past the next expected charge date.
+  guardUntil  DateTime?
+  failureReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user         User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subscription Subscription       @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  guide        CancellationGuide? @relation(fields: [guideId], references: [id])
+
+  @@index([userId, status])
+  @@index([subscriptionId, startedAt(sort: Desc)])
+  @@map("cancellation_cases")
+}
+
+// -----------------------------------------------------------------------------
+//  Signals, alerts, audit
+// -----------------------------------------------------------------------------
+
+/// Proxy for "is the user actually using this service?". In production this is
+/// fed by explicit user marking, Screen Time / Digital Wellbeing imports, or
+/// app-open webhooks. The zombie risk engine consumes it.
+model EngagementSignal {
+  id          String @id @default(uuid()) @db.Uuid
+  userId      String @db.Uuid
+  merchantKey String
+
+  lastInteractionAt DateTime?
+  /// Self-reported or imported opens in the trailing 30 days.
+  interactionsLast30d Int    @default(0)
+  source            String   @default("USER_DECLARED")
+
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, merchantKey])
+  @@map("engagement_signals")
+}
+
+/// Tenant-level correction to the normaliser. When a user relabels a merchant,
+/// the fix must survive the next detection run.
+model MerchantOverride {
+  id           String @id @default(uuid()) @db.Uuid
+  userId       String @db.Uuid
+  /// Matched against the normalised descriptor, case-insensitive.
+  descriptorPattern String
+  merchantKey  String
+  merchantName String
+  category     SubscriptionCategory
+  channel      BillingChannel @default(UNKNOWN)
+  /// Explicitly mark noise so it can never become a subscription candidate.
+  forceIgnore  Boolean @default(false)
+
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, descriptorPattern])
+  @@map("merchant_overrides")
+}
+
+model Alert {
+  id             String @id @default(uuid()) @db.Uuid
+  userId         String @db.Uuid
+  subscriptionId String? @db.Uuid
+
+  kind     AlertKind
+  severity AlertSeverity @default(INFO)
+  /// Turkish, ready to render.
+  title    String
+  body     String
+  /// Optional numeric payload (amount, days, percent) for the UI chip.
+  payload  Json?
+
+  /// Deduplication key, e.g. "PRICE_HIKE:spotify:2026-04". Prevents the same
+  /// alert being raised on every detection run.
+  dedupeKey String
+
+  readAt      DateTime?
+  dismissedAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subscription Subscription? @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, dedupeKey])
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("alerts")
+}
+
+/// One row per detection engine execution — makes the pipeline debuggable in
+/// production and lets us diff heuristic versions against real data.
+model DetectionRun {
+  id     String @id @default(uuid()) @db.Uuid
+  userId String @db.Uuid
+
+  engineVersion String
+  startedAt     DateTime @default(now())
+  finishedAt    DateTime?
+
+  transactionsScanned Int @default(0)
+  streamsDetected     Int @default(0)
+  subscriptionsCreated Int @default(0)
+  subscriptionsUpdated Int @default(0)
+  priceChangesFound    Int @default(0)
+  alertsRaised         Int @default(0)
+
+  /// Tunables in effect for this run, for reproducibility.
+  config Json?
+  error  String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, startedAt(sort: Desc)])
+  @@map("detection_runs")
+}
