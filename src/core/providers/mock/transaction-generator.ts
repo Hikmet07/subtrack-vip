@@ -442,7 +442,7 @@ export function generateLedger(options: GenerateLedgerOptions): GeneratedLedger 
       const monthAnchor = addMonthsClamped(now, -monthsAgo);
       const payday = scheduleChargeDate(monthAnchor, 15, rng, true);
       if (payday.getTime() > now.getTime()) continue;
-      push(salaryAccount, payday, salary, 'MAAS ODEMESI - DITRAVO TEKNOLOJI A.S.', 'CREDIT', {
+      push(salaryAccount, payday, salary, 'MAAS ODEMESI - ORNEK YAZILIM A.S.', 'CREDIT', {
         simulated: true,
         income: true,
       });
