@@ -9,6 +9,8 @@ for the billing rail that actually pulls the money.
 The interface is entirely Turkish. The code, comments and documentation are
 English.
 
+**Live:** https://subtrack-vip.vercel.app
+
 ```bash
 npm install
 npm run demo    # detection engine + scorecard, no database, no browser
